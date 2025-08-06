@@ -80,25 +80,122 @@ def download_ffmpeg():
     if os.name != 'nt': return
     exes = ['ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe']
     if all(os.path.exists(e) for e in exes): return
-    api_url = 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest'
-    r = requests.get(api_url, headers={'Accept': 'application/vnd.github+json'})
-    assets = r.json().get('assets', [])
-    zip_asset = next((a for a in assets if 'essentials_build.zip' in a['name']), None)
-    if not zip_asset: return
-    zip_url = zip_asset['browser_download_url']
-    zip_name = zip_asset['name']
-    with requests.get(zip_url, stream=True) as resp:
-        total = int(resp.headers.get('Content-Length', 0))
-        with open(zip_name, 'wb') as f, tqdm(total=total, unit='B', unit_scale=True) as pbar:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-                pbar.update(len(chunk))
-    with zipfile.ZipFile(zip_name) as z:
-        for f in z.namelist():
-            if f.endswith(tuple(exes)) and '/bin/' in f:
-                z.extract(f)
-                os.rename(f, os.path.basename(f))
-    os.remove(zip_name)
+    
+    print("正在检查并下载 FFmpeg...")
+    
+    # 添加重试机制
+    max_retries = 3
+    retry_delay = 5  # 秒
+    
+    for attempt in range(max_retries):
+        try:
+            # 检查网络连接
+            try:
+                test_response = requests.get('https://api.github.com', timeout=10)
+                if test_response.status_code != 200:
+                    print(f"网络连接测试失败，状态码: {test_response.status_code}")
+                    if attempt < max_retries - 1:
+                        print(f"等待 {retry_delay} 秒后重试...")
+                        time.sleep(retry_delay)
+                        continue
+                    else:
+                        print("网络连接失败，跳过 FFmpeg 下载")
+                        return
+            except requests.exceptions.RequestException as e:
+                print(f"网络连接测试失败: {e}")
+                if attempt < max_retries - 1:
+                    print(f"等待 {retry_delay} 秒后重试...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print("网络连接失败，跳过 FFmpeg 下载")
+                    return
+            
+            api_url = 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest'
+            r = requests.get(api_url, headers={'Accept': 'application/vnd.github+json'}, timeout=30)
+            r.raise_for_status()  # 检查 HTTP 状态码
+            
+            assets = r.json().get('assets', [])
+            zip_asset = next((a for a in assets if 'essentials_build.zip' in a['name']), None)
+            if not zip_asset: 
+                print("未找到 FFmpeg 下载链接")
+                return
+                
+            zip_url = zip_asset['browser_download_url']
+            zip_name = zip_asset['name']
+            
+            print(f"开始下载 FFmpeg: {zip_name}")
+            
+            # 使用更小的 chunk_size 和更长的超时时间
+            with requests.get(zip_url, stream=True, timeout=1200) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get('Content-Length', 0))
+                
+                if total == 0:
+                    print("无法获取文件大小，跳过下载")
+                    return
+                
+                with open(zip_name, 'wb') as f, tqdm(total=total, unit='B', unit_scale=True, desc="下载进度") as pbar:
+                    downloaded = 0
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:  # 过滤掉 keep-alive 新块
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            pbar.update(len(chunk))
+                            
+                            # 检查下载是否中断
+                            if downloaded >= total:
+                                break
+            
+            print("FFmpeg 下载完成，正在解压...")
+            
+            # 解压文件
+            with zipfile.ZipFile(zip_name) as z:
+                for f in z.namelist():
+                    if f.endswith(tuple(exes)) and '/bin/' in f:
+                        z.extract(f)
+                        os.rename(f, os.path.basename(f))
+            
+            # 清理下载的压缩包
+            os.remove(zip_name)
+            print("FFmpeg 安装完成！")
+            return
+            
+        except requests.exceptions.ChunkedEncodingError as e:
+            print(f"下载中断错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"等待 {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+                # 清理可能的不完整文件
+                if os.path.exists(zip_name):
+                    try:
+                        os.remove(zip_name)
+                    except:
+                        pass
+                continue
+            else:
+                print("下载失败，跳过 FFmpeg 安装")
+                return
+                
+        except requests.exceptions.RequestException as e:
+            print(f"网络请求错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"等待 {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                print("网络请求失败，跳过 FFmpeg 安装")
+                return
+                
+        except Exception as e:
+            print(f"未知错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"等待 {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                print("安装失败，跳过 FFmpeg 安装")
+                return
 
 
 def format_time(seconds):
@@ -9051,7 +9148,18 @@ def create_ui():
 
 if __name__ == "__main__":
     atexit.register(autosave_queue)
-    download_ffmpeg()
+    
+    # 检查是否跳过 FFmpeg 下载
+    skip_ffmpeg_download = os.getenv('SKIP_FFMPEG_DOWNLOAD', 'false').lower() == 'true'
+    if not skip_ffmpeg_download:
+        try:
+            download_ffmpeg()
+        except Exception as e:
+            print(f"FFmpeg 下载失败: {e}")
+            print("程序将继续运行，但某些功能可能不可用")
+    else:
+        print("跳过 FFmpeg 下载")
+    
     # threading.Thread(target=runner, daemon=True).start()
     os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
     server_port = int(args.server_port)
